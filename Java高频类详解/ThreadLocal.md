@@ -521,9 +521,250 @@ get执行流程:
 - C. 如果e不为null, 则返回e.value, 否则转到D
 - D. Map为空或者e为空, 则通过initialValue函数获取初始值value, 然后用ThreadLocal的引用和value作为firstKey和firstValue创建一个新的Map
 
-总结: 先获取当前线程的ThreadLocalMap变量, 如果存在则返回值, 不存在则创建并返回初始值
+总结: <b>先获取当前线程的ThreadLocalMap变量, 如果存在则返回值, 不存在则创建并返回初始值</b>
 
 ### 4.3 remove方法
-(1) 源码和对应的中文注释
+```java
+public void remove() {
+    ThreadLocalMap m = getMap(Thread.currentThread());
+    if (m != null)
+        m.remove(this);
+}
+```
+remove执行流程:
+- A.首先获取当前线程, 并根据当前线程获取一个Map
+- B.如果获取的Map不为空, 则移除当前的ThreadLocal对象对应的entry
 
+### 4.4 initialValue方法
+```java
+protected T initialValue() {
+    return null;
+}
+```
+此方法的作用是: 返回该线程局部变量的初始值
 
+(1) 这个方法是一个延迟调用方法, 从上边的代码我们得知, 在set方法还未调用而先调用了get方法时才执行, 并且仅执行一次<br>
+(2) 这个方法的缺省实现是直接返回一个null<br>
+(3) 如果想要一个除了null之外的初始值, 可以重写这个方法(备注: 该方法是一个protected的方法, 显然是为了让子类覆盖而设计的)
+
+## 5. ThreadLocalMap源码分析
+在分析ThreadLocal方法时, 我们了解到ThreadLocal的操作实际上是围绕ThreadLocalMap展开的.<br>
+ThreadLocalMap的源码相对比较复杂, 我们从以下三个方面进行讨论.
+
+### 5.1 基本结构
+ThreadLocalMap是ThreadLocal的内部类, 没有实现Map接口, 用独立的方式实现了Map的功能, 其内部的Entry也是独立实现的.
+
+![alt text](images/ThreadLocal-005.png)
+
+#### 5.1.1 成员变量
+```java
+private static final int INITIAL_CAPACITY = 16;
+
+private Entry[] table;
+
+private int size = 0;
+
+private int threshold;
+```
+跟HashMap类似<br>
+INITIAL_CAPACITY 代表这个Map的初始容量;<br>
+table 是一个Entry类型的数组, 用于存储数据;<br>
+size 代表表中的存储数目;<br>
+threshold 代表需要扩容时对应size的阈值<br>
+
+#### 5.1.2 存储结构-Entry
+```java
+static class Entry extends WeakReference<ThreadLocal<?>> {
+    /** The value associated with this ThreadLocal. */
+    Object value;
+
+    Entry(ThreadLocal<?> k, Object v) {
+        super(k);
+        value = v;
+    }
+}
+```
+ThreadLocalMap中, 也是用Entry来保存K-V结构数据的. 不过Entry中的key只能是ThreadLocal对象, 这点在构造方法中已经限定死了.
+
+另外, Entry继承WeakReference, 也就是key(ThreadLocal)是弱引用, 其目的是将ThreadLocal对象的生命周期和线程生命周期解绑.
+
+### 5.2 弱引用和内层泄露
+有些程序员在使用ThreadLocal的过程中会发现有内存泄露的情况发生, 就猜测这个内存泄露跟Entry中使用了弱引用的key有关, 这个理解其实是不对的
+
+我们先来回顾这个问题中涉及的几个概念, 再来分析问题
+
+#### 5.2.1 内层泄露相关概念
+- Memory overflow: 内存溢出, 没有足够的内存提供申请者使用.
+- Memory leak: 内层泄露, 程序中已动态分配的堆内存由于某种原因程序未释放或无法释放, 造成系统内存的浪费, 导致程序运行速度减慢甚至系统崩溃等严重后果. 内存泄露的堆积终将导致内存溢出.
+
+#### 5.2.2 弱引用相关概念
+
+java中的引用有4种类型, 强, 软, 弱, 虚. 当前这个问题主要涉及到强引用和弱引用
+- <b>强引用(Strong Reference)</b>: 我们常见的普通对象引用, 只要还有强引用指向一个对象, 就能表明对象还活着, 垃圾回收器就不会回收这种对象
+- <b>弱引用(Weak Reference)</b>: 垃圾回收器一旦发现了只具有弱引用的对象, 不管当前内存空间足够与否, 都会回收它的内存
+  
+#### 5.2.3 如果key使用强引用
+
+假设ThreadLocalMap中的key使用了强引用, 那么会出现内层泄露吗?<br>
+
+此时ThreadLocal的内存图(实线表示强引用)如下:
+![alt text](images/ThreadLocal-006.png)
+
+1. 假设在业务代码中使用完ThreadLocal, ThreadLocal Ref被回收了
+2. 但是因为ThreadLocalMap的Entry强引用了ThreadLocal, 造成ThreadLocal无法被回收
+3. 在没有手动删除这个Entry以及CurrentThread依然运行的前提下, 始终有强引用链CurrentThreadRef -> CurrentThread -> ThreadLocalMap -> Entry, Entry就不会被回收(Entry中包含了ThreadLocal实例和value), 导致Entry内层泄露
+
+也就是说, ThreadLocalMap中的key使用了强引用, 是无法完全避免内存泄露的
+
+#### 5.2.4 如果key使用弱引用
+
+假设ThreadLocalMap中的key使用了弱引用, 那么会出现内层泄露吗?<br>
+
+此时ThreadLocal的内存图(虚线表示弱引用)如下:
+![alt text](images/ThreadLocal-007.png)
+
+1. 同样假设在业务代码中使用完ThreadLocal, ThreadLocal Ref被回收了
+2. 由于ThreadLocalMap只持有ThreadLocal的弱引用, 没有任何强引用指向ThreadLocal实例,所以ThreadLocal就可以顺利被gc回收, 此时Entry中的key=null
+3. 但是在没有手动删除这个Entry以及CurrentThread依然运行的前提下, 也存在有强引用链 CurrentThreadRef -> CurrentThread -> ThreadLocalMap -> Entry -> value, value不会被回收, 而这块value永远也不会被访问到了, 导致value内层泄露
+
+也就是说, ThreadLocalMap中的key使用了弱引用, 也有可能内层泄露
+
+#### 5.2.5 出现内存泄露的真正原因
+比较以上两种情况, 我们会发现, 内层泄露的发生和ThreadLocalMap中的key是否是强引用和弱引用无关
+
+那么内存泄露的真正原因是什么?
+
+细心的同学会发现, 在以上两种内存泄露的情况中, 都有两个前提:
+1. 没有手动删除这个Entry
+2. CurrentThread依然运行
+
+第一点很好理解, 只要在使用完ThreadLocal, 调用其remove方法删除对应的Entry, 就能避免内层泄露
+
+第二点稍微复杂点, 由于ThreadLocalMap是Thread的一个属性, 被当前线程所引用, 所以它的生命周期跟Thread一样长. 那么在使用完ThreadLocal, 如果当前线程也随之执行结束, ThreadLocalMap自然也会被gc回收, 从根源上避免了内存泄露
+
+综上, ThreadLocal内存泄露的根本原因是: 由于ThreadLocalMap的生命周期跟Thread一样长, 如果没有手动删除对应key就会导致内存泄露.
+
+#### 5.2.6 为什么jdk8中使用弱引用
+根据刚才的分析, 我们知道了: 无论ThreadLocalMap中key使用哪种引用类型, 都无法完全避免内存泄露, 跟使用弱引用没有关系
+
+要避免内存泄露有两种方式:
+1. 使用完ThreadLocal, 调用其remove方法删除对应的Entry
+2. 使用完ThreadLocal, 当前Thread也随之运行结束
+
+相对于第一种方式, 第二种方式显然更不好控制, 特别是使用线程池的时候, 线程结束是不会销毁的.
+
+也就是说, 只要记得在使用完ThreadLocal及时的调用remove方法, 无论key是强引用还是弱引用都不会出现问题, 那么为什么key要使用弱引用呢?
+
+事实上, 在ThreadLocalMap中的set/getEntry方法中, 会对key为null(也即ThreadLocal为null)进行判断, 如果为null的话, 那么会对value置为null的.
+
+这就意味着, 使用完ThreadLocal, CurrentThread依然在运行的情况下, 就算忘记手动调用remove方法, 弱引用比强引用多一层保障: 弱引用的ThreadLocal会被回收, 对应的value在下一次ThreadLocalMap调用set,get,remove中的任一方法的时候会被清除, 从而避免内存泄露.
+
+### 5.3 Hash冲突的解决
+Hash冲突的解决是Map中的一个重要内容. 我们以Hash冲突的解决为线索, 来研究下ThreadLocalMap的核心源码
+#### 5.3.1 从ThreadLocal的set方法入手
+```java
+public class ThreadLocal<T> {
+    public void set(T value) {
+        Thread t = Thread.currentThread();
+        ThreadLocalMap map = getMap(t);
+        if (map != null)
+            map.set(this, value);
+        else
+            createMap(t, value);
+    }
+
+    ThreadLocalMap getMap(Thread t) {
+        return t.threadLocals;
+    }
+
+    void createMap(Thread t, T firstValue) {
+        t.threadLocals = new ThreadLocalMap(this, firstValue);
+    }
+}
+```
+这个方法我们刚才分析过, 其作用是设置当前线程绑定的局部变量:
+- A.首先获取当前线程, 并根据当前线程获取一个map
+- B.如果获取的map不为空, 则将参数设置到map中(当前ThreadLocal的引用作为key) (<b>这里调用了ThreadLocalMap的set方法</b>)
+- C.如果获取的map为空, 则给该线程创建map, 并设置初始值 (<b>这里调用了ThreadLocalMap的构造方法</b>)
+
+这段代码有两个地方分别涉及到ThreadLocalMap的两个方法, 我们接着分析这两个方法
+
+#### 5.3.2 构造方法-ThreadLocalMap(ThreadLocal<?> firstKey, Object firstValue)
+
+```java
+public class ThreadLocal<T> {
+    static class ThreadLocalMap {
+        ThreadLocalMap(ThreadLocal<?> firstKey, Object firstValue) {
+            table = new Entry[INITIAL_CAPACITY];
+            int i = firstKey.threadLocalHashCode & (INITIAL_CAPACITY - 1);
+            table[i] = new Entry(firstKey, firstValue);
+            size = 1;
+            setThreshold(INITIAL_CAPACITY);
+        }
+    }
+}
+```
+
+构造函数首先创建一个长度为16的Entry数组,然后计算出firstKey对应的索引, 然后存储到table中, 并设置size和threshold
+
+<b>重点分析</b>: 
+```java
+int i = firstKey.threadLocalHashCode & (INITIAL_CAPACITY - 1);
+```
+
+1. 关于firstKey.ThreadLocalHashCode:
+   ```java
+   public class ThreadLocal<T> {
+        private static AtomicInteger nextHashCode =
+        new AtomicInteger();
+
+        private static final int HASH_INCREMENT = 0x61c88647;
+
+        private static int nextHashCode() {
+            return nextHashCode.getAndAdd(HASH_INCREMENT);
+        }
+
+        private final int threadLocalHashCode = nextHashCode();
+   }
+   ```
+   这里定义了一个AtomicInteger类型, 每次获取当前值并加上HASH_INCREMENT.<br>
+   HASH_INCREMENT = 0x61c88647, 这个值跟斐波那契数列(黄金分割数)有关, 其主要目的就是为了让Hash码能均匀的分布在2的n次方的数组里, 也就是Entry[] table中, 这样做可以尽量避免Hash冲突.<br>
+
+2. 关于 & (INITIAL_CAPACITY - 1)
+    
+   计算Hash的时候里面采用了hashcode&(size-1)的算法, 这相当于取模运算hashcode%size的一个更高效的实现. <br>
+   这是因为这种算法, 我们要求size必须是2的整数次幂, 这也能保证在索引不越界的前提下, 使得hash发生冲突的次数减小.
+
+#### 5.3.3 ThreadLocalMap中的set方法
+```java
+public class ThreadLocal<T> {
+    static class ThreadLocalMap {
+        private void set(ThreadLocal<?> key, Object value) {
+            Entry[] tab = table;
+            int len = tab.length;
+            int i = key.threadLocalHashCode & (len-1);
+            // 使用线性探测法查找元素(重点代码)
+            for (Entry e = tab[i];
+                 e != null;
+                 e = tab[i = nextIndex(i, len)]) {
+                ThreadLocal<?> k = e.get();
+
+                if (k == key) {
+                    e.value = value;
+                    return;
+                }
+
+                if (k == null) {
+                    replaceStaleEntry(key, value, i);
+                    return;
+                }
+            }
+
+            tab[i] = new Entry(key, value);
+            int sz = ++size;
+            if (!cleanSomeSlots(i, sz) && sz >= threshold)
+                rehash();
+        }
+    }
+} 
+```
